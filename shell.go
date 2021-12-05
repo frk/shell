@@ -1,146 +1,133 @@
-package sshell
+package shell
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand"
-	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"net"
 	"os"
-	"os/signal"
+	"os/exec"
+	"strconv"
 	"strings"
-	"syscall"
 
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
 )
 
-type command struct {
-	// the full (including args) command being executed
-	str string
-	// the stdout of the command
-	out []byte
-	// the stderr of the command
-	err []byte
-	// the exit status of the command
-	exit string
-}
+// shell implements Shell
+type shell struct {
+	// for a local shell this will hold the command
+	// that starts the interactive shell process
+	bin *exec.Cmd
+	// for a remote shell this will hold the ssh
+	// session and the ssh connection information
+	ssh *sshShell
 
-func (c command) String() string {
-	return fmt.Sprintf("command: %q\n - exit code: %q\n - stdout: %s\n - stderr: %s",
-		c.str, c.exit, string(c.out), string(c.err))
-}
-
-type cmderror struct {
-	c command
-}
-
-func (e cmderror) Error() string {
-	return fmt.Sprintf("command: %q\n - exit code: %s\n - stderr: %s",
-		e.c.str, e.c.exit, string(e.c.err))
-}
-
-// Shell represents a remote login shell.
-type Shell struct {
-	host string
-	user string
-
+	host   string
+	user   string
+	motd   string
 	client *ssh.Client
 	sess   *ssh.Session
-	motd   string
 
 	stdin  io.WriteCloser
 	stdout io.Reader
 	stderr io.Reader
 
 	// the command currently executed, gets reset by each invocation of sh.run()
-	cmd command
-	sch chan error
-
+	cmd      command
+	sch      chan error
+	retry    map[string]map[string]uint
 	boundary string
+	coe      bool // continue on error
 	err      error
 }
 
-// New starts an SSH client connection to the given host, opens
-// a new session for the client, and then sets up a Shell.
-func New(host, user string) (*Shell, error) {
-	authMethod, err := sshAgentAuth()
-	if err != nil && err != errEmptySSHAgent {
-		return nil, err
-	} else if err == errEmptySSHAgent {
-		authMethod, err = privateKey()
-		if err != nil {
-			return nil, err
+// Err retruns the last encountered error.
+func (sh *shell) Err() (err error) {
+	return sh.err
+}
+
+// Close closes the shell's session and releases its resources.
+func (sh *shell) Close() (err error) {
+	if sh.stdin != nil {
+		if e := sh.printf("exit"); e != nil {
+			err = e
+		}
+		if e := sh.stdin.Close(); e != nil {
+			err = e
 		}
 	}
-	hostKeyCallback, err := fixedHostKeyFor(host)
-	if err != nil {
-		return nil, err
+	if sh.bin != nil {
+		if e := sh.bin.Wait(); e != nil {
+			err = e
+		}
 	}
+	if sh.ssh != nil {
+		if e := sh.ssh.Close(); e != nil {
+			err = e
+		}
+	}
+	return err
+}
 
-	sh := &Shell{
-		host: host,
-		user: user,
-		sch:  make(chan error),
+// Exec runs cmd in the shell.
+func (sh *shell) Exec(cmd string, a ...interface{}) error {
+	if sh.err != nil && sh.coe == false {
+		return sh.err
 	}
-
-	sh.client, err = ssh.Dial("tcp", net.JoinHostPort(sh.host, "22"), &ssh.ClientConfig{
-		User:            user,
-		Auth:            []ssh.AuthMethod{authMethod},
-		HostKeyCallback: hostKeyCallback,
-	})
-	if err != nil {
-		return nil, err
-	}
-	sh.sess, err = sh.client.NewSession()
-	if err != nil {
-		return nil, err
-	}
-	sh.stdin, err = sh.sess.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	sh.stdout, err = sh.sess.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	sh.stderr, err = sh.sess.StderrPipe()
-	if err != nil {
-		return nil, err
-	}
-	sh.boundary, err = makeBoundary()
-	if err != nil {
-		return nil, err
-	}
-
-	if err := sh.sess.Shell(); err != nil {
-		return nil, err
-	}
-
-	// scan motd
-	if err := sh.run("echo"); err != nil {
+	if err := sh.run(cmd, a...); err != nil {
 		sh.err = err
-	} else {
-		sh.motd = string(sh.cmd.out)
+		return sh.err
 	}
-	return sh, nil
+	return nil
+}
+
+// Out runs cmd in the shell and returns its standard output.
+func (sh *shell) Out(cmd string, a ...interface{}) (string, error) {
+	if sh.err != nil && sh.coe == false {
+		return "", sh.err
+	}
+	if err := sh.run(cmd, a...); err != nil {
+		sh.err = err
+		return "", sh.err
+	}
+
+	return string(sh.cmd.out), nil
+}
+
+func (sh *shell) retryCount() (count uint) {
+	if len(sh.retry) == 0 {
+		return 0
+	}
+	prog := sh.cmd.str
+	if s := strings.Fields(prog); len(s) > 0 {
+		prog = s[0]
+	}
+
+	exits, ok := sh.retry[prog]
+	if !ok {
+		if exits, ok = sh.retry["*"]; !ok {
+			return 0
+		}
+	}
+	count, ok = exits[sh.cmd.exit]
+	if !ok {
+		if count, ok = exits["*"]; !ok {
+			return 0
+		}
+	}
+	return count
 }
 
 // just a convenience wrapper around fmt.Fprintf that writes to stdin of the shell
-func (sh *Shell) printf(format string, a ...interface{}) (err error) {
+func (sh *shell) printf(format string, a ...interface{}) (err error) {
 	if _, err := fmt.Fprintf(sh.stdin, format+"\r\n", a...); err != nil {
 		return err
 	}
 	return err
 }
 
-// scans standard output & error
-func (sh *Shell) scan() {
+// starts the scanning of standard output & standard error
+func (sh *shell) start() {
 	ch := make(chan error)
 
 	// stderr scanner
@@ -200,14 +187,14 @@ stdoutScan:
 }
 
 // waits for scan to finish
-func (sh *Shell) wait() error {
+func (sh *shell) wait() error {
 	if err := <-sh.sch; err != nil {
-		sh.err = err
+		sh.err = scanError{sh.cmd, err}
 		return err
 	}
 
 	if sh.cmd.exit != "0" {
-		sh.err = cmderror{sh.cmd}
+		sh.err = cmdError{sh.cmd}
 		return sh.err
 	}
 	return nil
@@ -215,191 +202,236 @@ func (sh *Shell) wait() error {
 }
 
 // run runs cmd
-func (sh *Shell) run(cmd string, a ...interface{}) error {
+func (sh *shell) run(cmd string, a ...interface{}) error {
 	if len(a) > 0 {
 		cmd = fmt.Sprintf(cmd, a...)
 	}
 	cmd = strings.TrimSpace(cmd)
 	cmd = strings.TrimRight(cmd, ";")
-
-	sh.cmd = command{str: cmd}
-	if sh.cmd.str == "" {
+	if cmd == "" {
 		return nil
 	}
 
-	go sh.scan()
+	sh.cmd = command{str: cmd}
+
+	go sh.start()
 	if err := sh.printf("%s; echo '%s'$?", sh.cmd.str, sh.boundary); err != nil {
 		return err
 	}
-	return sh.wait()
-}
-
-// Err retruns the last encountered error.
-func (sh *Shell) Err() (err error) {
-	return sh.err
-}
-
-// Close closes the shell's session and releases its resources.
-func (sh *Shell) Close() (err error) {
-	if sh.stdin != nil {
-		if e := sh.printf("exit"); e != nil {
-			err = e
+	if err := sh.wait(); err != nil {
+		count := sh.retryCount()
+		if count == 0 {
+			return err
 		}
-		if e := sh.stdin.Close(); e != nil {
-			err = e
-		}
-	}
-	if sh.sess != nil {
-		if e := sh.sess.Close(); e != nil {
-			err = e
-		}
-	}
-	return err
-}
 
-// Exec runs cmd on the remote shell.
-func (sh *Shell) Exec(cmd string, a ...interface{}) error {
-	if sh.err != nil {
-		return sh.err
-	}
-	if err := sh.run(cmd, a...); err != nil {
-		sh.err = err
-		return sh.err
+		orig := sh.cmd
+		for count > 0 {
+			sh.cmd = command{str: orig.str}
+
+			go sh.start()
+			if e := sh.printf("%s; echo '%s'$?", sh.cmd.str, sh.boundary); e != nil {
+				return e
+			}
+			if e := sh.wait(); e != nil {
+				count -= 1
+				continue
+			} else {
+				err = nil
+				break
+			}
+		}
+		sh.cmd = orig
+		return err
 	}
 	return nil
 }
 
-// Out runs cmd on the remote shell and returns its standard output.
-func (sh *Shell) Out(cmd string, a ...interface{}) (string, error) {
-	if sh.err != nil {
-		return "", sh.err
-	}
-	if err := sh.run(cmd, a...); err != nil {
-		sh.err = err
-		return "", sh.err
-	}
-
-	return string(sh.cmd.out), nil
+// an error caused by a command
+type cmdError struct {
+	cmd command
 }
 
-var errEmptySSHAgent = errors.New("empty_ssh_agent")
-
-func sshAgentAuth() (ssh.AuthMethod, error) {
-	socket := os.Getenv("SSH_AUTH_SOCK")
-	conn, err := net.Dial("unix", socket)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to open SSH_AUTH_SOCK: %v", err)
-	}
-
-	client := agent.NewClient(conn)
-	signers, err := client.Signers()
-	if err != nil {
-		return nil, fmt.Errorf("Failed to retrieve signers: %v", err)
-	} else if len(signers) == 0 {
-		return nil, errEmptySSHAgent
-	}
-
-	return ssh.PublicKeysCallback(client.Signers), nil
+func (e cmdError) Error() string {
+	return fmt.Sprintf("command: %q\n - exit code: %s\n - stderr: %s",
+		e.cmd.str, e.cmd.exit, string(e.cmd.err))
 }
 
-func privateKey() (ssh.AuthMethod, error) {
-	keyFile, err := os.Open(os.Getenv("HOME") + "/.ssh/id_rsa")
+// an error returned by bufio.Scanner
+type scanError struct {
+	cmd command
+	err error
+}
+
+func (e scanError) Error() string {
+	return fmt.Sprintf("command: %q\n - bufio.Scanner error: %v",
+		e.cmd.str, e.err)
+}
+
+// represents a command being executed by shell
+type command struct {
+	// the full (including args) command being executed
+	str string
+	// the stdout of the command
+	out []byte
+	// the stderr of the command
+	err []byte
+	// the exit status of the command
+	exit string
+}
+
+func (c command) String() string {
+	return fmt.Sprintf("command: %q\n - exit code: %q\n - stdout: %s\n - stderr: %s",
+		c.str, c.exit, string(c.out), string(c.err))
+}
+
+type Shell interface {
+	Err() error
+	Close() error
+	Exec(cmd string, a ...interface{}) error
+	Out(cmd string, a ...interface{}) (string, error)
+}
+
+type Config struct {
+	// If Host is set, it will be used, together with User, to establish a
+	// remote, interactive SSH connection. If User is unset, it will default
+	// to $USER environment variable.
+	Host, User string
+	// If the above Host is unset, then Name will be used as the name, or
+	// file path, of the local shell to be executed in interactive mode.
+	// If both, Host and Name, are unset, then the $SHELL environment variable
+	// will be used to determine which shell to execute, and if that environment
+	// variable is not set, then /bin/bash will be executed as default.
+	Name string
+	// A list of expressions used to configure the shell to re-try commands
+	// that returned with a non-zero exit status.
+	//
+	// An expression MUST be of the following format:
+	//
+	//	"<prog_name>:<exit_status>:<count>"
+	//
+	// All three values in the expression MUST be non-empty.
+	// - "prog_name" will be used to match the failed command's program name.
+	//   Can be set to the wildcard "*" to match any program.
+	// - "exit_status" will be used to match the failed command's exit status.
+	//   MUST either be an integer in the range 1-255 (inclusive), or it
+	//   can be set to the wildcard "*" to match any exit status.
+	// - "count" is the number of re-tries that the shell should do.
+	//   MUST be an integer greater than 0.
+	Retry []string
+	// If set to true the shell will keep executing commands even if an error occurs.
+	ContinueOnError bool
+}
+
+func New(c Config) (_ Shell, err error) {
+	sh := new(shell)
+	sh.sch = make(chan error)
+	sh.retry = make(map[string]map[string]uint)
+	sh.coe = c.ContinueOnError
+	sh.boundary, err = makeBoundary()
 	if err != nil {
 		return nil, err
 	}
-	defer keyFile.Close()
 
-	key, err := ioutil.ReadAll(keyFile)
-	if err != nil {
-		return nil, err
-	}
-
-	signer, err := ssh.ParsePrivateKey(key)
-	if err != nil {
-		var e *ssh.PassphraseMissingError
-		if !errors.As(err, &e) {
-			return nil, err
+	for _, x := range c.Retry {
+		xs := strings.Split(x, ":")
+		if len(xs) != 3 {
+			return nil, fmt.Errorf("shell: bad retry expression %q", x)
 		}
-		pass := passphrasePrompt("Private Key Passphrase: ")
-		signer, err = ssh.ParsePrivateKeyWithPassphrase(key, pass)
-		if err != nil {
-			return nil, err
+
+		exits := sh.retry[xs[0]]
+		if exits == nil {
+			exits = make(map[string]uint)
+			sh.retry[xs[0]] = exits
 		}
-	}
 
-	return ssh.PublicKeys(signer), nil
-}
-
-func passphrasePrompt(prompt string) []byte {
-	state, err := terminal.GetState(syscall.Stdin)
-	if err != nil {
-		panic(err)
-	}
-
-	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt, os.Kill)
-	go func() {
-		<-c
-		_ = terminal.Restore(syscall.Stdin, state)
-		os.Exit(1)
-	}()
-
-	fmt.Print(prompt)
-	pass, err := terminal.ReadPassword(syscall.Stdin)
-	fmt.Println("")
-	if err != nil {
-		panic(err)
-	}
-
-	signal.Stop(c)
-	return pass
-}
-
-func fixedHostKeyFor(host string) (ssh.HostKeyCallback, error) {
-	knownHostsFile, err := os.Open(os.Getenv("HOME") + "/.ssh/known_hosts")
-	if err != nil {
-		return nil, err
-	}
-	defer knownHostsFile.Close()
-
-	knownHosts, err := ioutil.ReadAll(knownHostsFile)
-	if err != nil {
-		return nil, err
-	}
-
-	key := ssh.PublicKey(nil)
-	for {
-		_, hosts, pubKey, _, rest, err := ssh.ParseKnownHosts(knownHosts)
-		if err != nil {
-			if err == io.EOF {
-				// TODO prompt for confirmation that
-				// it's ok to connect to the given host.
-				return ssh.InsecureIgnoreHostKey(), nil
+		if s := xs[1]; s != "*" {
+			// make sure its a valid non-zero exit status
+			u8, err := strconv.ParseUint(s, 10, 8)
+			if err != nil {
+				return nil, fmt.Errorf("shell: error parsing retry exit status: %v", err)
 			}
-			return nil, err
-		}
-		knownHosts = rest
-
-		for i := range hosts {
-			if host == hosts[i] {
-				key = pubKey
-				break
+			if u8 < 1 || 255 < u8 {
+				return nil, fmt.Errorf("shell: bad retry exit status: %d", u8)
 			}
 		}
-		if key != nil {
-			break
+		count, err := strconv.ParseUint(xs[2], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("shell: error parsing retry count: %v", err)
+		}
+		exits[xs[1]] = uint(count)
+	}
+
+	if len(c.Host) > 0 {
+		if err := initSSH(c.Host, c.User, sh); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := initLocal(c.Name, sh); err != nil {
+			return nil, err
 		}
 	}
 
-	return ssh.FixedHostKey(key), nil
+	return sh, nil
 }
 
-func makeBoundary() (string, error) {
-	b := make([]byte, 32/4*3)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+func initLocal(name string, sh *shell) (err error) {
+	if name == "" {
+		name = os.Getenv("SHELL")
+	}
+	if name == "" {
+		name = "/bin/bash"
 	}
 
-	b64 := base64.URLEncoding.EncodeToString(b)
-	return "-----" + b64 + "-----", nil
+	var args []string
+	switch name {
+	case "/bin/zsh":
+		args = []string{"-i", "-s"}
+	case "/bin/bash":
+		args = []string{"-i"}
+	}
+
+	sh.bin = exec.Command(name, args...)
+	if sh.stdin, err = sh.bin.StdinPipe(); err != nil {
+		return err
+	}
+	if sh.stdout, err = sh.bin.StdoutPipe(); err != nil {
+		return err
+	}
+	if sh.stderr, err = sh.bin.StderrPipe(); err != nil {
+		return err
+	}
+	if err := sh.bin.Start(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func initSSH(host, user string, sh *shell) (err error) {
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+
+	if sh.ssh, err = newSSHShell(host, user); err != nil {
+		return err
+	}
+	if sh.stdin, err = sh.ssh.StdinPipe(); err != nil {
+		return err
+	}
+	if sh.stdout, err = sh.ssh.StdoutPipe(); err != nil {
+		return err
+	}
+	if sh.stderr, err = sh.ssh.StderrPipe(); err != nil {
+		return err
+	}
+	if err = sh.ssh.Shell(); err != nil {
+		return err
+	}
+
+	// scan motd
+	if err := sh.run("echo"); err != nil {
+		return err
+	} else {
+		sh.ssh.motd = string(sh.cmd.out)
+	}
+	return nil
 }
