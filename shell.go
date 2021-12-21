@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -99,19 +100,19 @@ func (sh *shell) retryCount() (count uint) {
 		return 0
 	}
 	prog := sh.cmd.str
-	if s := strings.Fields(prog); len(s) > 0 {
-		prog = s[0]
+	if ff := strings.Fields(prog); len(ff) > 0 {
+		prog = ff[0]
 	}
 
-	exits, ok := sh.retry[prog]
+	exit, ok := sh.retry[prog]
 	if !ok {
-		if exits, ok = sh.retry["*"]; !ok {
+		if exit, ok = sh.retry["*"]; !ok {
 			return 0
 		}
 	}
-	count, ok = exits[sh.cmd.exit]
+	count, ok = exit[sh.cmd.exit]
 	if !ok {
-		if count, ok = exits["*"]; !ok {
+		if count, ok = exit["*"]; !ok {
 			return 0
 		}
 	}
@@ -207,7 +208,9 @@ func (sh *shell) run(cmd string, a ...interface{}) error {
 		cmd = fmt.Sprintf(cmd, a...)
 	}
 	cmd = strings.TrimSpace(cmd)
-	cmd = strings.TrimRight(cmd, ";")
+	if strings.HasSuffix(cmd, ";") && !strings.HasSuffix(cmd, "\\;") {
+		cmd = cmd[:len(cmd)-1]
+	}
 	if cmd == "" {
 		return nil
 	}
@@ -219,13 +222,16 @@ func (sh *shell) run(cmd string, a ...interface{}) error {
 		return err
 	}
 	if err := sh.wait(); err != nil {
-		count := sh.retryCount()
-		if count == 0 {
+		retry := sh.retryCount()
+		if retry == 0 {
 			return err
 		}
 
 		orig := sh.cmd
-		for count > 0 {
+		for retry > 0 {
+			fmt.Printf("retrying %q...\n", orig.str)
+			time.Sleep(3 * time.Second)
+
 			sh.cmd = command{str: orig.str}
 
 			go sh.start()
@@ -233,7 +239,7 @@ func (sh *shell) run(cmd string, a ...interface{}) error {
 				return e
 			}
 			if e := sh.wait(); e != nil {
-				count -= 1
+				retry -= 1
 				continue
 			} else {
 				err = nil
@@ -296,6 +302,9 @@ type Config struct {
 	// remote, interactive SSH connection. If User is unset, it will default
 	// to $USER environment variable.
 	Host, User string
+	// If connecting to Host fails, the ConnRetry field can be used to set
+	// how many times should the shell try to connect before giving up.
+	ConnRetry int
 	// If the above Host is unset, then Name will be used as the name, or
 	// file path, of the local shell to be executed in interactive mode.
 	// If both, Host and Name, are unset, then the $SHELL environment variable
@@ -317,7 +326,7 @@ type Config struct {
 	//   can be set to the wildcard "*" to match any exit status.
 	// - "count" is the number of re-tries that the shell should do.
 	//   MUST be an integer greater than 0.
-	Retry []string
+	CmdRetry []string
 	// If set to true the shell will keep executing commands even if an error occurs.
 	ContinueOnError bool
 }
@@ -332,7 +341,7 @@ func New(c Config) (_ Shell, err error) {
 		return nil, err
 	}
 
-	for _, x := range c.Retry {
+	for _, x := range c.CmdRetry {
 		xs := strings.Split(x, ":")
 		if len(xs) != 3 {
 			return nil, fmt.Errorf("shell: bad retry expression %q", x)
@@ -361,16 +370,24 @@ func New(c Config) (_ Shell, err error) {
 		exits[xs[1]] = uint(count)
 	}
 
-	if len(c.Host) > 0 {
-		if err := initSSH(c.Host, c.User, sh); err != nil {
-			return nil, err
-		}
-	} else {
+	if len(c.Host) == 0 {
 		if err := initLocal(c.Name, sh); err != nil {
 			return nil, err
 		}
+		return sh, nil
 	}
 
+	if err := initSSH(c.Host, c.User, sh); err != nil {
+		for retry := c.ConnRetry; retry > 0; retry-- {
+			fmt.Printf("retrying ssh to %q...\n", c.Host)
+			time.Sleep(3 * time.Second)
+
+			if err := initSSH(c.Host, c.User, sh); err == nil {
+				return sh, nil
+			}
+		}
+		return nil, err
+	}
 	return sh, nil
 }
 
@@ -407,6 +424,17 @@ func initLocal(name string, sh *shell) (err error) {
 }
 
 func initSSH(host, user string, sh *shell) (err error) {
+	defer func() {
+		if err != nil {
+			if sh.stdin != nil {
+				sh.stdin.Close()
+			}
+			if sh.ssh != nil && sh.ssh.Session != nil {
+				sh.ssh.Session.Close()
+			}
+		}
+	}()
+
 	if user == "" {
 		user = os.Getenv("USER")
 	}
@@ -428,7 +456,7 @@ func initSSH(host, user string, sh *shell) (err error) {
 	}
 
 	// scan motd
-	if err := sh.run("echo"); err != nil {
+	if err = sh.run("echo"); err != nil {
 		return err
 	} else {
 		sh.ssh.motd = string(sh.cmd.out)
